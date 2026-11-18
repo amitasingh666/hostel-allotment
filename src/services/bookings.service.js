@@ -99,6 +99,28 @@ async function takeSeat(client, roomId) {
   return rows[0].remaining;
 }
 
+/**
+ * Gives one seat back and returns the seats remaining afterwards.
+ *
+ * Callers must only call this after they have actually turned one ACTIVE
+ * booking of this room into a CANCELLED one, in the same transaction. That is
+ * what keeps a seat from being freed twice for the same booking.
+ */
+async function releaseSeat(client, roomId) {
+  const { rows } = await client.query(
+    `UPDATE rooms SET occupied_count = occupied_count - 1
+     WHERE room_id = $1 AND occupied_count > 0
+     RETURNING capacity - occupied_count AS remaining`,
+    [roomId]
+  );
+  if (rows.length === 0) {
+    // An active booking existed but its room had no occupied seat: the data is
+    // inconsistent. Fail the whole transaction rather than paper over it.
+    throw new Error(`Room ${roomId} has an active booking but occupied_count is 0`);
+  }
+  return rows[0].remaining;
+}
+
 function alreadyBooked() {
   return new AppError(409, 'ALREADY_BOOKED', 'You already have an active booking');
 }
@@ -148,6 +170,60 @@ async function createBooking(studentId, roomId, claimed = {}) {
 }
 
 /**
+ * Loads one of the student's own bookings and locks it for this transaction.
+ *
+ * The lookup is by booking id AND owner together, so a booking that belongs
+ * to someone else is indistinguishable from one that does not exist: both are
+ * BOOKING_NOT_FOUND. Answering "forbidden" would confirm the id is real.
+ */
+async function lockOwnBooking(client, studentId, bookingId) {
+  const { rows } = await client.query(
+    `SELECT booking_id, room_id, status FROM bookings
+     WHERE booking_id = $1 AND student_id = $2 FOR UPDATE`,
+    [bookingId, studentId]
+  );
+  if (rows.length === 0) {
+    throw new AppError(404, 'BOOKING_NOT_FOUND', 'Booking not found');
+  }
+  return rows[0];
+}
+
+/**
+ * Marks an ACTIVE booking as CANCELLED. Throws ALREADY_CANCELLED if it is not
+ * active. The `status = 'ACTIVE'` condition in the UPDATE is the guard: only a
+ * transaction that really changed the row may go on to free the seat.
+ */
+async function markCancelled(client, booking) {
+  const { rowCount } = await client.query(
+    `UPDATE bookings SET status = 'CANCELLED', cancelled_at = now()
+     WHERE booking_id = $1 AND status = 'ACTIVE'`,
+    [booking.booking_id]
+  );
+  if (rowCount === 0) {
+    throw new AppError(409, 'ALREADY_CANCELLED', 'Booking is already cancelled');
+  }
+}
+
+/**
+ * Cancels the logged-in student's booking and frees its seat.
+ *
+ * The booking row is kept (status CANCELLED) for history. Calling this twice,
+ * even at the same instant, frees the seat once: the second call finds the
+ * booking no longer active and is rejected with nothing changed.
+ */
+async function cancelBooking(studentId, bookingId) {
+  return withTransaction(async (client) => {
+    await lockStudent(client, studentId);
+
+    const booking = await lockOwnBooking(client, studentId, bookingId);
+    await markCancelled(client, booking);
+    const remaining = await releaseSeat(client, booking.room_id);
+
+    return { booking_id: booking.booking_id, remaining };
+  });
+}
+
+/**
  * The student's current active booking, or null if they have none.
  * Returns only the student's own booking and the room it is in: nothing about
  * who else is in that room.
@@ -165,4 +241,4 @@ async function getActiveBooking(studentId) {
   return rows[0] || null;
 }
 
-module.exports = { createBooking, getActiveBooking };
+module.exports = { createBooking, cancelBooking, getActiveBooking };

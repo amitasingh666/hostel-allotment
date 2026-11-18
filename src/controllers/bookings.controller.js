@@ -25,4 +25,20 @@ async function create(req, res) {
   res.status(201).json({ success: true, ...result });
 }
 
-module.exports = { create };
+/** Reads the :booking_id URL parameter, which arrives as text. */
+function parseBookingIdParam(req) {
+  const raw = req.params.booking_id;
+  return parseId(
+    /^\d+$/.test(raw) ? Number(raw) : NaN,
+    'INVALID_BOOKING_ID',
+    'booking_id must be a positive integer'
+  );
+}
+
+async function cancel(req, res) {
+  const bookingId = parseBookingIdParam(req);
+  const result = await bookingsService.cancelBooking(req.studentId, bookingId);
+  res.json({ success: true, ...result });
+}
+
+module.exports = { create, cancel };
