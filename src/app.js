@@ -3,6 +3,7 @@ const express = require('express');
 const { checkConnection } = require('./config/db');
 const authRoutes = require('./routes/auth.routes');
 const meRoutes = require('./routes/me.routes');
+const roomsRoutes = require('./routes/rooms.routes');
 const { notFoundHandler, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
@@ -20,6 +21,7 @@ app.get('/health', async (req, res) => {
 
 app.use('/auth', authRoutes);
 app.use('/me', meRoutes);
+app.use('/rooms', roomsRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
