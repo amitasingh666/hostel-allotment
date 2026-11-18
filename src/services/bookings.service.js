@@ -1,4 +1,4 @@
-const { withTransaction } = require('../config/db');
+const { pool, withTransaction } = require('../config/db');
 const { AppError } = require('../errors');
 
 const UNIQUE_VIOLATION = '23505';
@@ -147,4 +147,22 @@ async function createBooking(studentId, roomId, claimed = {}) {
   }
 }
 
-module.exports = { createBooking };
+/**
+ * The student's current active booking, or null if they have none.
+ * Returns only the student's own booking and the room it is in: nothing about
+ * who else is in that room.
+ */
+async function getActiveBooking(studentId) {
+  const { rows } = await pool.query(
+    `SELECT b.booking_id, b.room_id, r.room_number, h.name AS hostel_name,
+            b.status, b.created_at
+     FROM bookings b
+     JOIN rooms r ON r.room_id = b.room_id
+     JOIN hostels h ON h.hostel_id = r.hostel_id
+     WHERE b.student_id = $1 AND b.status = 'ACTIVE'`,
+    [studentId]
+  );
+  return rows[0] || null;
+}
+
+module.exports = { createBooking, getActiveBooking };
