@@ -5,7 +5,7 @@ const authRoutes = require('./routes/auth.routes');
 const meRoutes = require('./routes/me.routes');
 const roomsRoutes = require('./routes/rooms.routes');
 const bookingsRoutes = require('./routes/bookings.routes');
-const { notFoundHandler, errorHandler } = require('./middleware/error.middleware');
+const { notFoundHandler, errorHandler } = require('./errors');
 
 const app = express();
 
