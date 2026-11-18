@@ -14,8 +14,7 @@ The central requirement is that every rule holds when requests arrive at the sam
 4. [API](#api)
 5. [How each rule is enforced and verified](#how-each-rule-is-enforced-and-verified)
 6. [Demonstrating concurrency with two app instances](#demonstrating-concurrency-with-two-app-instances)
-7. [Design decisions](#design-decisions)
-8. [Project structure](#project-structure)
+7. [Project structure](#project-structure)
 
 ## Setup
 
@@ -328,22 +327,6 @@ Open two terminals, run `docker compose exec db psql` in each, and treat each as
 | 5 | | `ROLLBACK;` |
 
 `UPDATE 0` is what the app reports as `ROOM_FULL`. This is the statement the booking code runs, and it shows the database deciding the winner. Run `npm run db:seed` afterwards.
-
-## Design decisions
-
-Choices made where the requirements left room:
-
-- **Plain SQL through `pg`, no ORM.** The correctness depends on specific statements, locks and transaction boundaries, and plain SQL keeps them visible.
-- **A room change creates a new booking row.** The old booking is marked cancelled and kept as history, and the response returns the new `booking_id`. A cancel aimed at the old id returns `ALREADY_CANCELLED`.
-- **Another student's booking returns 404, not 403.** A 403 would confirm that the booking id exists.
-- **A body naming another student is rejected, not ignored.** Booking silently for the logged-in student would hide an attempt to act for someone else. A body carrying the student's own identity is accepted, and a `hostel_id` in the body is ignored.
-- **Cancelling has no fees check.** The requirements block booking and changing for unpaid students, not cancelling.
-- **Fees are checked before the room.** A student with unpaid fees is told about fees whatever room they ask for.
-- **Unpaid students can still view rooms.**
-- **Changing to the current room is rejected** with `SAME_ROOM`.
-- **Ids must be JSON integers.** `"room_id": "2"` (a string) is rejected with `INVALID_ROOM_ID`.
-- **`current_year` is limited to 1–4**, and gender to `BOYS` or `GIRLS`, by database constraints.
-- **The token is checked against the database on every request,** so a token for a student who no longer exists stops working.
 
 ## Project structure
 
