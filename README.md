@@ -12,9 +12,7 @@ The central requirement is that every rule holds when requests arrive at the sam
 2. [How the app connects to the database](#how-the-app-connects-to-the-database)
 3. [Seeded data and logins](#seeded-data-and-logins)
 4. [API](#api)
-5. [How each rule is enforced and verified](#how-each-rule-is-enforced-and-verified)
-6. [Demonstrating concurrency with two app instances](#demonstrating-concurrency-with-two-app-instances)
-7. [Project structure](#project-structure)
+5. [Project structure](#project-structure)
 
 ## Setup
 
@@ -198,136 +196,6 @@ On any failure the original booking and both room counts are left exactly as the
 ```json
 { "booking": null }
 ```
-
-### Other responses
-
-| Status | Code | When |
-|---|---|---|
-| 400 | `INVALID_JSON` | the request body is not valid JSON |
-| 404 | `NOT_FOUND` | no such route |
-| 500 | `INTERNAL_ERROR` | unexpected failure; details are logged on the server only |
-
-## How each rule is enforced and verified
-
-**No automated test suite ships with this repository.** Each rule was verified by running requests against the live API and checking the database afterwards. The concurrency rules can be reproduced by hand with the [two-instance procedure](#demonstrating-concurrency-with-two-app-instances) below. During development they were also exercised with a script that fired bursts of simultaneous requests split across two app processes; that script is not included here.
-
-| Rule | How it is enforced | How it was verified |
-|---|---|---|
-| **A room is never booked beyond capacity** | The seat is taken by one statement, `UPDATE rooms SET occupied_count = occupied_count + 1 WHERE room_id = $1 AND occupied_count < capacity`. PostgreSQL makes a second simultaneous update wait, then re-checks the condition against the new count. A `CHECK (occupied_count BETWEEN 0 AND capacity)` constraint is a second line of defence. | 10 students booking the 1 remaining seat at once across two processes: 1 success, 9 `ROOM_FULL`, room exactly 3/3. 9 students for 3 seats: 3 successes, 6 `ROOM_FULL`. |
-| **One active booking per student** | Every booking action first locks the student's own row (`SELECT ... FOR UPDATE`), so one student's requests run one after another, whichever process receives them. A unique index on `bookings (student_id) WHERE status = 'ACTIVE'` is a second line of defence. | One student sending 6 simultaneous bookings at 3 different rooms: 1 success, 5 `ALREADY_BOOKED`. Double-click on the same room: 1 success, 1 `ALREADY_BOOKED`, seat taken once. |
-| **Login reveals nothing about which registration numbers exist** | Unknown number, wrong password and missing fields all throw the same error. For an unknown number, a bcrypt comparison still runs against a dummy hash so the response takes the same time. | The two failures returned byte-for-byte identical responses. Median response time over 25 requests each: 72.6 ms (wrong password) vs 72.7 ms (unknown number). |
-| **Identity comes only from the token** | The token holds only the student id. The auth middleware sets `req.studentId`, and no route reads a student id from the body, query or URL. Only the HS256 algorithm is accepted. | Missing, malformed, tampered, expired, wrong-secret, `alg: none` and wrong-algorithm tokens, and a token for a student that does not exist, all returned the same 401. Adding `?student_id=` or `?year=` to requests changed nothing. |
-| **Acting on another student's behalf is rejected** | A booking or change whose body names a different `student_id` or `registration_no` gets `CANNOT_ACT_FOR_ANOTHER_STUDENT`. Cancel and change look bookings up by id **and** owner together. | Both body variants were rejected. Cancelling and changing another student's booking returned `BOOKING_NOT_FOUND`. All counts unchanged. |
-| **Year and gender eligibility** | Inside the booking transaction, the room is joined to the hostel it actually belongs to, and that hostel's year and gender are compared with the student's stored `current_year` and `gender`. The registration number is never parsed, and a `hostel_id` from the client is never read. | Year-2 student → year-1 hostel, both repeaters → year-2 hostel, promoted backlog student → year-1 hostel, girl → boys hostel: all `ROOM_NOT_ALLOWED`, counts unchanged, including when the body carried the student's own `hostel_id`. Both repeaters then booked the year-1 hostel successfully. |
-| **Unpaid fees block booking and changing** | `fees_paid` is read from the locked student row inside the transaction, at request time. It is not in the token. | The unpaid student got `FEES_NOT_PAID`. A student holding a seat whose stored flag was then set to unpaid was refused a room change using the same, still-valid token. |
-| **Cancel frees the seat exactly once, only for the owner** | The booking is marked cancelled by `UPDATE ... WHERE booking_id = $1 AND status = 'ACTIVE'`, and the seat is released only if that update changed a row. The booking row is kept for history. | 2 cancels at once: 1 success, 1 `ALREADY_CANCELLED`, count 1 → 0. 6 cancels at once on a seat in a full room: count 2 → 1. A later cancel was rejected with the count unchanged. The student could book again afterwards. |
-| **Room change is atomic** | One transaction: take the new seat, cancel the old booking, release the old seat, insert the new booking. Every check, including "new room is full", passes before the old booking is touched; any failure rolls everything back. Both room rows are locked in ascending `room_id` order to prevent deadlocks. | Each failure (full, not found, wrong year, wrong gender, same room, unpaid) left the original booking and both counts untouched. A change racing a cancel of the same booking always ended in one of two states: moved to the new room, or no booking. Two students swapping rooms at once, 20 times: all succeeded, no deadlock. |
-| **`GET /rooms` is correct at all times** | Counts are read directly from the `rooms` table on every request, with no cache. `occupied_count` only changes inside the same transaction as its booking. | Immediately after a burst of bookings, `GET /rooms` on both processes reported the room as full. |
-| **No response exposes another student's details** | Responses contain only room and hostel fields and the caller's own booking. Another student's booking is reported as `BOOKING_NOT_FOUND`, the same as a booking that does not exist. | `GET /me/booking` with a roommate in the same room returned only the caller's booking. |
-| **Counts stay consistent** | Every multi-step operation is one transaction through a single `withTransaction` helper. | After every scenario above: each room's `occupied_count` equalled its number of active bookings, no room was over capacity or below zero, and no student had more than one active booking. |
-
-To confirm these checks were meaningful, the same scripted races were run against deliberately broken copies of the code. With the conditional update replaced by "read the count, then write count + 1", 10 students all got the last seat. With the database guards replaced by an in-memory lock inside each process, 2 students got the last seat when the requests were split across two processes.
-
-## Demonstrating concurrency with two app instances
-
-This reproduces "two students click Book for the last seat at the same instant" using two app processes on different ports and one database. Commands are for Windows PowerShell; a bash version of the race command follows.
-
-### 1. Reset the data
-
-```powershell
-npm run db:seed
-```
-
-Room 2 (Aravali 102) now has exactly 1 seat left.
-
-### 2. Start two app processes
-
-Terminal 1 (port 3000):
-
-```powershell
-npm start
-```
-
-Terminal 2 (port 3001):
-
-```powershell
-$env:PORT=3001; node server.js
-```
-
-### 3. Log in as a different student in each of two more terminals
-
-Terminal 3, student A, using port 3000:
-
-```powershell
-$T = (Invoke-RestMethod -Method Post -Uri http://localhost:3000/auth/login -ContentType "application/json" -Body '{"registration_no":"2026CS001","password":"Password@123"}').token
-```
-
-Terminal 4, student B, using port 3001:
-
-```powershell
-$T = (Invoke-RestMethod -Method Post -Uri http://localhost:3001/auth/login -ContentType "application/json" -Body '{"registration_no":"2026CS002","password":"Password@123"}').token
-```
-
-### 4. Fire both bookings at the same clock second
-
-Each command waits for a clock time and then sends the request. Choose a time about a minute ahead and use the same time in both terminals.
-
-Terminal 3:
-
-```powershell
-while ((Get-Date) -lt [datetime]"13:10:00") { }; curl.exe -s -X POST http://localhost:3000/bookings -H "Authorization: Bearer $T" -H "Content-Type: application/json" -d '{\"room_id\":2}'
-```
-
-Terminal 4:
-
-```powershell
-while ((Get-Date) -lt [datetime]"13:10:00") { }; curl.exe -s -X POST http://localhost:3001/bookings -H "Authorization: Bearer $T" -H "Content-Type: application/json" -d '{\"room_id\":2}'
-```
-
-One terminal prints `{"success":true,"booking_id":5,"remaining":0}` and the other prints `{"error":"ROOM_FULL","message":"Room is full"}`. Which student wins can differ between runs.
-
-Bash equivalent of the race command, with `T` holding the token:
-
-```bash
-while [[ "$(date +%H:%M:%S)" < "13:10:00" ]]; do :; done; curl -s -X POST http://localhost:3000/bookings -H "Authorization: Bearer $T" -H "Content-Type: application/json" -d '{"room_id":2}'
-```
-
-### 5. Confirm the result from both processes and from the database
-
-```powershell
-curl.exe -s http://localhost:3000/rooms -H "Authorization: Bearer $T"
-curl.exe -s http://localhost:3001/rooms -H "Authorization: Bearer $T"
-docker compose exec db psql -c "SELECT room_id, capacity, occupied_count FROM rooms WHERE room_id = 2"
-```
-
-Both processes report room 2 as `"occupied_count":3,"remaining":0,"is_full":true`, and the database shows 3 of 3.
-
-### Other races with the same method
-
-Run `npm run db:seed` between races. Tokens stay valid after a re-seed.
-
-| Race | Setup | Expected |
-|---|---|---|
-| Double-click | Log in as the **same** student in both terminals; book room 1 in both | one success, one `ALREADY_BOOKED` |
-| One student, two rooms | Same student in both; `room_id` 1 in one terminal and 4 in the other | one success, one `ALREADY_BOOKED` |
-| Cancel twice | Book first, then use `.../bookings/<id>/cancel` (no `-d` body) in the timed command in both | one success, one `ALREADY_CANCELLED` |
-
-The two requests arrive a few milliseconds apart, and a booking takes only a few milliseconds, so they may run back to back and not strictly overlap. The slow-motion version below makes the overlap visible.
-
-### The same race in slow motion, at the database
-
-Open two terminals, run `docker compose exec db psql` in each, and treat each as one student.
-
-| Step | Terminal 1 | Terminal 2 |
-|---|---|---|
-| 1 | `BEGIN;` | `BEGIN;` |
-| 2 | `UPDATE rooms SET occupied_count = occupied_count + 1 WHERE room_id = 2 AND occupied_count < capacity;` → `UPDATE 1` | |
-| 3 | | the same `UPDATE` → waits |
-| 4 | `COMMIT;` | → continues and prints `UPDATE 0` |
-| 5 | | `ROLLBACK;` |
-
-`UPDATE 0` is what the app reports as `ROOM_FULL`. This is the statement the booking code runs, and it shows the database deciding the winner. Run `npm run db:seed` afterwards.
-
 ## Project structure
 
 ```
