@@ -224,6 +224,72 @@ async function cancelBooking(studentId, bookingId) {
 }
 
 /**
+ * Locks both room rows, lower room_id first.
+ *
+ * A change touches two rooms. If two students swap at the same instant
+ * (A -> B and B -> A) and each locked "its" rooms in its own order, each would
+ * hold one room and wait forever for the other. Taking the locks in one fixed
+ * order for everybody makes that impossible.
+ */
+async function lockRoomsInOrder(client, roomIdA, roomIdB) {
+  await client.query(
+    `SELECT room_id FROM rooms WHERE room_id IN ($1, $2)
+     ORDER BY room_id FOR UPDATE`,
+    [roomIdA, roomIdB]
+  );
+}
+
+/**
+ * Moves the logged-in student from their current booking to `newRoomId`.
+ *
+ * The old booking is cancelled (kept as history) and a new booking is created,
+ * all in one transaction. Every check, including "is the new room full",
+ * passes before the old booking is touched, and any failure rolls everything
+ * back: the student keeps the original seat and both room counts are as they
+ * were. The student can never end up with no seat or with two.
+ */
+async function changeRoom(studentId, bookingId, newRoomId, claimed = {}) {
+  return withTransaction(async (client) => {
+    const student = await lockStudent(client, studentId);
+
+    assertActingForSelf(studentId, student, claimed);
+    assertFeesPaid(student);
+
+    const booking = await lockOwnBooking(client, studentId, bookingId);
+    if (booking.status !== 'ACTIVE') {
+      throw new AppError(409, 'ALREADY_CANCELLED', 'Booking is already cancelled');
+    }
+    if (booking.room_id === newRoomId) {
+      throw new AppError(409, 'SAME_ROOM', 'You are already in this room');
+    }
+
+    await assertRoomAllowed(client, student, newRoomId);
+    await lockRoomsInOrder(client, booking.room_id, newRoomId);
+
+    // New seat first: if the new room is full this throws before anything
+    // about the old booking has changed.
+    const remaining = await takeSeat(client, newRoomId);
+
+    // The old booking must stop being ACTIVE before the new one is inserted,
+    // or the one-active-booking-per-student index would reject the insert.
+    await markCancelled(client, booking);
+    await releaseSeat(client, booking.room_id);
+
+    const { rows } = await client.query(
+      `INSERT INTO bookings (student_id, room_id) VALUES ($1, $2)
+       RETURNING booking_id`,
+      [studentId, newRoomId]
+    );
+
+    return {
+      booking_id: rows[0].booking_id,
+      old_booking_id: booking.booking_id,
+      remaining,
+    };
+  });
+}
+
+/**
  * The student's current active booking, or null if they have none.
  * Returns only the student's own booking and the room it is in: nothing about
  * who else is in that room.
@@ -241,4 +307,4 @@ async function getActiveBooking(studentId) {
   return rows[0] || null;
 }
 
-module.exports = { createBooking, cancelBooking, getActiveBooking };
+module.exports = { createBooking, cancelBooking, changeRoom, getActiveBooking };

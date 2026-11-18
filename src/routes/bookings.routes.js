@@ -9,5 +9,6 @@ router.use(requireAuth);
 
 router.post('/', bookingsController.create);
 router.post('/:booking_id/cancel', bookingsController.cancel);
+router.post('/:booking_id/change', bookingsController.change);
 
 module.exports = router;

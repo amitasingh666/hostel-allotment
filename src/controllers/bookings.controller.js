@@ -41,4 +41,21 @@ async function cancel(req, res) {
   res.json({ success: true, ...result });
 }
 
-module.exports = { create, cancel };
+async function change(req, res) {
+  const body = req.body || {};
+  const bookingId = parseBookingIdParam(req);
+  const newRoomId = parseId(
+    body.new_room_id,
+    'INVALID_ROOM_ID',
+    'new_room_id must be a positive integer'
+  );
+
+  const result = await bookingsService.changeRoom(req.studentId, bookingId, newRoomId, {
+    studentId: body.student_id,
+    registrationNo: body.registration_no,
+  });
+
+  res.json({ success: true, ...result });
+}
+
+module.exports = { create, cancel, change };
